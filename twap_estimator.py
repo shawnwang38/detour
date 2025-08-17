@@ -10,18 +10,66 @@ import sys
 import os
 import math
 import copy
+from symbols import REVERSED_TO_GEMINI, is_valid_pair, get_gemini_symbol
 
+from symbols import SYMBOLS_SET
 
-def get_market_data(symbol: str, use_live: bool = True) -> Dict:
+def split_pair(pair: str) -> tuple:
     """
-    Fetch order book and market statistics.
+    Split a pair string into two valid currency symbols.
+    
+    Args:
+        pair: Trading pair string (e.g., 'BTCUSD', 'USDTBTC')
     
     Returns:
-        Dict containing order_book, daily_volume, mid_price, spread
+        Tuple of (base, quote) if valid, (None, None) if invalid
+        
+    Examples:
+        'BTCUSD' -> ('BTC', 'USD')
+        'USDTBTC' -> ('USDT', 'BTC') 
+        'ABCDEF' -> (None, None)
     """
+    pair_upper = pair.upper()
+    
+    # Try 3-character split first
+    if len(pair_upper) >= 6:
+        base_3 = pair_upper[:3]
+        quote_3 = pair_upper[3:]
+        
+        if base_3 in SYMBOLS_SET and quote_3 in SYMBOLS_SET:
+            return (base_3, quote_3)
+    
+    # Try 4-character split
+    if len(pair_upper) >= 7:
+        base_4 = pair_upper[:4]
+        quote_4 = pair_upper[4:]
+        
+        if base_4 in SYMBOLS_SET and quote_4 in SYMBOLS_SET:
+            return (base_4, quote_4)
+    
+    return (None, None)
+
+def get_market_data(raw_symbol: str, use_live: bool = True) -> Dict:
+    """
+    Fetch order book and market statistics.
+    """
+    # Quick validity check first
+    if not is_valid_pair(raw_symbol):
+        return None
+    
+    # Get the proper Gemini symbol and check if it needs reversal
+    symbol = get_gemini_symbol(raw_symbol)
+    if not symbol:
+        return None
+    
+    # Check if this is a reversed notation
+    raw_lower = raw_symbol.lower()
+    forward = raw_lower not in REVERSED_TO_GEMINI
+
     # Get order book
     if use_live:
         url = f"https://api.gemini.com/v1/book/{symbol}"
+
         try:
             response = requests.get(url)
             response.raise_for_status()
@@ -35,17 +83,49 @@ def get_market_data(symbol: str, use_live: bool = True) -> Dict:
         except Exception as e:
             print(f"Error fetching order book: {e}")
             return None
+        
+        # If using reversed symbol, need to invert prices and swap sides
+        if not forward:
+            # Swap bids and asks (buying USD means selling BTC)
+            original_bids = book_data['bids']
+            original_asks = book_data['asks']
+            
+            # Convert asks to bids (and vice versa) with inverted prices
+            book_data['bids'] = []
+            for level in original_asks:
+                original_price = level['price']
+                book_data['bids'].append({
+                    'price': 1 / original_price,
+                    'amount': level['amount'] * original_price  # Convert to reversed denomination
+                })
+            
+            book_data['asks'] = []
+            for level in original_bids:
+                original_price = level['price']
+                book_data['asks'].append({
+                    'price': 1 / original_price,
+                    'amount': level['amount'] * original_price  # Convert to reversed denomination
+                })
+            
+            # Sort properly (bids descending, asks ascending)
+            book_data['bids'] = sorted(book_data['bids'], key=lambda x: -x['price'])
+            book_data['asks'] = sorted(book_data['asks'], key=lambda x: x['price'])
+                
     else:
         # Use cached data
         os.makedirs('test_data', exist_ok=True)
-        filename = f'test_data/{symbol}_snapshot.json'
+        filename = f'test_data/{raw_symbol}_snapshot.json'
         
         if os.path.exists(filename):
             with open(filename, 'r') as f:
                 book_data = json.load(f)
         else:
-            # Fetch once and save
-            book_data = get_market_data(symbol, use_live=True)['order_book']
+            # Fetch once and save - handle the None case!
+            result = get_market_data(raw_symbol, use_live=True)
+            if result is None:
+                print(f"Failed to fetch data for {raw_symbol}")
+                return None
+            book_data = result['order_book']
             with open(filename, 'w') as f:
                 json.dump(book_data, f, indent=2)
     
@@ -58,12 +138,19 @@ def get_market_data(symbol: str, use_live: bool = True) -> Dict:
         
         # Extract daily volume
         volume_keys = list(ticker['volume'].keys())
-        daily_volume = float(ticker['volume'][volume_keys[0]]) if volume_keys else 0
+        if forward:
+            daily_volume = float(ticker['volume'][volume_keys[0]])
+        else:
+            # For reversed pairs, need to get the USD volume
+            # volume_keys[0] is usually the base currency (e.g., BTC)
+            # volume_keys[1] is usually USD
+            # For reversed, we want the USD volume
+            daily_volume = float(ticker['volume'][volume_keys[1]])
     except:
         daily_volume = 0
     
     # Calculate metrics
-    if book_data['bids'] and book_data['asks']:
+    if book_data and book_data['bids'] and book_data['asks']:
         best_bid = book_data['bids'][0]['price']
         best_ask = book_data['asks'][0]['price']
         mid_price = (best_bid + best_ask) / 2
@@ -73,13 +160,12 @@ def get_market_data(symbol: str, use_live: bool = True) -> Dict:
     
     return {
         'order_book': book_data,
-        'daily_volume': daily_volume if daily_volume > 0 else 100000,  # Default fallback
+        'daily_volume': daily_volume,
         'mid_price': mid_price,
         'spread': spread,
         'best_bid': best_bid,
         'best_ask': best_ask
     }
-
 
 def predict_lob(order_book: Dict, time_elapsed: float, market_stats: Optional[Dict] = None) -> Dict:
     """
@@ -88,44 +174,90 @@ def predict_lob(order_book: Dict, time_elapsed: float, market_stats: Optional[Di
     """
     book = copy.deepcopy(order_book)
     
-    # Extract initial book from market_stats if available
-    initial_book = market_stats.get('initial_book') if market_stats else None
+    # Extract pre-calculated bucket volumes if available
+    initial_bucket_volumes = market_stats.get('initial_bucket_volumes') if market_stats else None
     
     # Step 1: Passive recovery (Obizhaeva-Wang)
-    book = passive_recovery(book, time_elapsed, initial_book)
+    book = passive_recovery(book, time_elapsed, initial_bucket_volumes)
     
     # Step 2: Brownian noise
-    book = add_brownian_noise(book, time_elapsed)
+    book = add_brownian_noise(book, time_elapsed, volatility=0.01)
     
     # Step 3: Queue reactive adjustment
     book = queue_reactive_adjustment(book, market_stats)
     
     return book
 
-
-
-def passive_recovery(order_book: Dict, time_elapsed: float, initial_book: Dict = None) -> Dict:
+def passive_recovery(order_book: Dict, time_elapsed: float, market_stats: Optional[Dict] = None) -> Dict:
     """
-    Obizhaeva-Wang style liquidity regeneration using price buckets.
-    Levels recover toward the average size of their price bucket from initial book.
+    Add new liquidity at competitive prices based on natural flow rate.
     """
-    if initial_book is None:
-        return order_book
-        
     book = copy.deepcopy(order_book)
-    resilience_rate = 0.1  # Per second
     
+    if not market_stats or 'daily_volume' not in market_stats:
+        return book
+    
+    # Natural flow rate from daily volume
+    daily_volume = market_stats['daily_volume']
+    flow_rate_per_second = daily_volume / 86400
+    expected_new_liquidity = flow_rate_per_second * time_elapsed
+    
+    # Add new liquidity near current best prices
     for side in ['bids', 'asks']:
-        if not book[side] or not initial_book[side]:
+        if not book[side]:
             continue
             
-        reference_price = initial_book[side][0]['price']
+        # Get current best price
+        best_price = book[side][0]['price']
         
-        # Build bucket profiles from initial book
-        bucket_volumes = {}
-        bucket_counts = {}
+        # Add competitive liquidity at and beyond best price
+        # Distribution: 40% at touch, 30% next tick, 20% next, 10% next
+        distribution = [0.4, 0.3, 0.2, 0.1]
+        tick_size = 0.01
         
-        for level in initial_book[side]:
+        for i, fraction in enumerate(distribution):
+            # Calculate price for new liquidity
+            if side == 'asks':
+                new_price = best_price + i * tick_size
+            else:  # bids
+                new_price = best_price - i * tick_size
+            
+            # Amount for this level
+            new_amount = (expected_new_liquidity / 2) * fraction
+            
+            # Add to existing level or create new
+            level_exists = False
+            for level in book[side]:
+                if abs(level['price'] - new_price) < tick_size / 2:
+                    level['amount'] += new_amount
+                    level_exists = True
+                    break
+            
+            if not level_exists:
+                book[side].append({'price': new_price, 'amount': new_amount})
+        
+        # Sort and trim
+        if side == 'asks':
+            book[side] = sorted(book[side], key=lambda x: x['price'])[:50]
+        else:
+            book[side] = sorted(book[side], key=lambda x: -x['price'])[:50]
+    
+    return book
+
+def calculate_bucket_volumes(order_book: Dict) -> Dict:
+    """
+    Calculate total volume per price bucket for each side of the book.
+    Used as equilibrium reference for passive recovery.
+    """
+    bucket_volumes = {'bids': {}, 'asks': {}}
+    
+    for side in ['bids', 'asks']:
+        if not order_book[side]:
+            continue
+            
+        reference_price = order_book[side][0]['price']
+        
+        for level in order_book[side]:
             # Calculate bucket: exponential growth (0-10bps, 10-20bps, 20-40bps, etc)
             distance_bps = abs(level['price'] - reference_price) / reference_price * 10000
             if distance_bps < 10:
@@ -133,55 +265,19 @@ def passive_recovery(order_book: Dict, time_elapsed: float, initial_book: Dict =
             else:
                 bucket = int(math.log2(distance_bps / 10)) + 1
             
-            if bucket not in bucket_volumes:
-                bucket_volumes[bucket] = 0
-                bucket_counts[bucket] = 0
+            if bucket not in bucket_volumes[side]:
+                bucket_volumes[side][bucket] = 0
             
-            bucket_volumes[bucket] += level['amount']
-            bucket_counts[bucket] += 1
-        
-        # Calculate equilibrium per bucket
-        bucket_equilibrium = {}
-        for bucket in bucket_volumes:
-            bucket_equilibrium[bucket] = bucket_volumes[bucket] / bucket_counts[bucket]
-        
-        # Apply recovery to current book
-        current_reference = book[side][0]['price'] if book[side] else reference_price
-        
-        for level in book[side]:
-            # Find this level's bucket
-            distance_bps = abs(level['price'] - current_reference) / current_reference * 10000
-            if distance_bps < 10:
-                bucket = 0
-            else:
-                bucket = int(math.log2(distance_bps / 10)) + 1
-            
-            # Get equilibrium size
-            if bucket in bucket_equilibrium:
-                equilibrium_size = bucket_equilibrium[bucket]
-            elif bucket_equilibrium:
-                # Use furthest bucket's size with decay
-                max_bucket = max(bucket_equilibrium.keys())
-                equilibrium_size = bucket_equilibrium[max_bucket] * (0.7 ** (bucket - max_bucket))
-            else:
-                equilibrium_size = level['amount']  # No change if no reference
-            
-            # Recover toward equilibrium
-            if level['amount'] < equilibrium_size:
-                deficit = equilibrium_size - level['amount']
-                recovery = deficit * (1 - math.exp(-resilience_rate * time_elapsed))
-                level['amount'] += recovery
+            bucket_volumes[side][bucket] += level['amount']
     
-    return book
+    return bucket_volumes
 
-
-def add_brownian_noise(order_book: Dict, time_elapsed: float) -> Dict:
+def add_brownian_noise(order_book: Dict, time_elapsed: float, volatility: float) -> Dict:
     """
     Add random liquidity fluctuations.
-    Models random order arrivals/cancellations.
+    Models zero-intelligence market activity using Brownian motion.
     """
     book = copy.deepcopy(order_book)
-    volatility = 0.2  # 20% volatility in liquidity
     
     for side in ['bids', 'asks']:
         for level in book[side]:
@@ -189,71 +285,75 @@ def add_brownian_noise(order_book: Dict, time_elapsed: float) -> Dict:
             std_dev = level['amount'] * volatility * math.sqrt(time_elapsed)
             noise = np.random.normal(0, std_dev)
             # Ensure non-negative
-            level['amount'] = max(0.1, level['amount'] + noise)
+            level['amount'] = max(0, level['amount'] + noise)
     
     return book
-
 
 def queue_reactive_adjustment(order_book: Dict, market_stats: Optional[Dict] = None) -> Dict:
     """
-    Adjust liquidity based on order book imbalance.
-    Thin side attracts more liquidity.
+    TODO: Improve queue-reactive model.
+    Simple queue-reactive model: thin side attracts liquidity, thick side loses it.
+    Based on the core insight that traders prefer less crowded queues.
     """
     book = copy.deepcopy(order_book)
     
-    # Calculate imbalance
-    total_bid_size = sum(level['amount'] for level in book['bids'][:5])
-    total_ask_size = sum(level['amount'] for level in book['asks'][:5])
+    if not book['bids'] or not book['asks']:
+        return book
     
-    if total_bid_size + total_ask_size > 0:
-        imbalance = (total_bid_size - total_ask_size) / (total_bid_size + total_ask_size)
-    else:
-        imbalance = 0
+    # Calculate volume imbalance (within 5 levels)
+    bid_volume = sum(level['amount'] for level in book['bids'][:5])
+    ask_volume = sum(level['amount'] for level in book['asks'][:5])
+    total_volume = bid_volume + ask_volume
     
-    # Adjust liquidity: thin side gets boost
-    boost_factor = 0.1  # 10% max adjustment
+    if total_volume == 0:
+        return book
     
-    if imbalance > 0.2:  # Bids are stronger, boost asks
-        for level in book['asks'][:3]:  # Top 3 levels
-            level['amount'] *= (1 + boost_factor)
-    elif imbalance < -0.2:  # Asks are stronger, boost bids
-        for level in book['bids'][:3]:  # Top 3 levels
-            level['amount'] *= (1 + boost_factor)
+    # Imbalance: -1 (all asks) to +1 (all bids)
+    imbalance = (bid_volume - ask_volume) / total_volume
+    
+    # Base flow rate: 10% of average level size
+    avg_level_size = total_volume / 10
+    base_flow = avg_level_size * 0.1
+    
+    # Adjust each side based on imbalance
+    # Thin side gains liquidity, thick side loses it
+    for side in ['bids', 'asks']:
+        # Bid side: positive imbalance means we're thick (lose liquidity)
+        # Ask side: negative imbalance means we're thick (lose liquidity)
+        side_imbalance = imbalance if side == 'bids' else -imbalance
+        
+        for i, level in enumerate(book[side][:5]):
+            if side_imbalance > 0.2:  # We're the thick side
+                # Orders cancel/migrate away
+                outflow = base_flow * side_imbalance * (1 - i/5)  # More at top
+                level['amount'] = max(0.1, level['amount'] - outflow)
+                
+            elif side_imbalance < -0.2:  # We're the thin side  
+                # New orders arrive
+                inflow = base_flow * abs(side_imbalance) * (1 - i/5)  # More at top
+                level['amount'] += inflow
     
     return book
 
-
-def calculate_price_impact(volume: float, time_interval: float, daily_volume: float) -> Dict[str, float]:
+def calculate_price_impact(volume: float, daily_volume: float, price: float) -> Dict[str, float]:
     """
-    Almgren-Chriss price impact model.
-    Returns permanent and temporary impact.
+    Models only permanent impact using Almgren-Chriss.
+    Temporary impact is already captured by walking up the LOB.
     """
-    # Convert daily volume to interval volume
-    seconds_per_day = 86400
-    interval_volume = daily_volume * (time_interval / seconds_per_day)
+    daily_volume_pct = volume / daily_volume if daily_volume > 0 else 0.01
+    interval_flow = daily_volume * (10 / 86400)
+    participation_rate = volume / interval_flow if interval_flow > 0 else 1.0
     
-    # Model parameters (typical institutional values)
-    gamma = 0.1  # Permanent impact constant
-    eta = 0.5    # Temporary impact constant
-    
-    # Normalize volume
-    if interval_volume > 0:
-        volume_ratio = volume / interval_volume
-    else:
-        volume_ratio = volume / (daily_volume / (seconds_per_day / time_interval))
-    
-    # Permanent impact: linear in volume
-    permanent = gamma * volume_ratio
-    
-    # Temporary impact: square-root for large orders
-    temporary = eta * math.sqrt(volume_ratio)
+    # Only permanent impact - shifts the mid-price for future intervals
+    gamma = participation_rate * 10 # gamma increases by 1 for every 10% participation rate
+    permanent_bps = gamma * daily_volume_pct * 100
+    permanent_price = (permanent_bps / 10000) * price
     
     return {
-        'permanent': permanent,
-        'temporary': temporary,
-        'total': permanent + temporary
+        'permanent': permanent_price,
+        'temporary': 0,  # Already captured by LOB walking
+        'total': permanent_price
     }
-
 
 def calculate_participation_rate(aggressiveness: float, spread_fraction: float) -> float:
     """
@@ -295,34 +395,60 @@ def calculate_limit_price(mid_price: float, spread: float, side: str, aggressive
     
     return limit_price
 
+def calculate_transaction_cost(order_volume: float, daily_volume: float, monthly_volume: float) -> float:
+    """Calculate transaction cost based on maker/taker fee percentages for Gemini"""
+    fees = [
+        (100_000_000, 0.00, 0.04),
+        (50_000_000, 0.00, 0.05),
+        (10_000_000, 0.02, 0.08),
+        (5_000_000, 0.03, 0.10),
+        (1_000_000, 0.05, 0.15),
+        (100_000, 0.08, 0.20),
+        (50_000, 0.10, 0.25),
+        (10_000, 0.15, 0.30),
+        (0, 0.20, 0.40)
+    ] # from Gemini
+    
+    for threshold, maker, taker in fees:
+        if monthly_volume >= threshold:
+            tx_rate = (maker/100, taker/100) 
+    
+    return order_volume * tx_rate[0] # TODO: use order_volume and daily_volume to find maker/taker split
 
 def calculate_execution_cost(
     symbol: str,
     side: str,
     volume: float,
     time_seconds: int,
-    limit_price: Optional[float] = None
+    limit_price: Optional[float] = None,
+    use_live: bool = True
 ) -> Dict:
     """
     Master function: Estimate TWAP execution cost.
     """
+
+    side = side.lower()
+    if side not in ['buy', 'sell']:
+        return {'error': 'Invalid side. Use "buy" or "sell".'}
+
     # 1. Setup
     interval_seconds = 10
     num_intervals = max(1, time_seconds // interval_seconds)
     base_volume_per_interval = volume / num_intervals
     
     # 2. Get market data
-    market_data = get_market_data(symbol, use_live=False)
+    market_data = get_market_data(symbol, use_live)
     if not market_data:
         return {'error': 'Failed to fetch market data'}
     
-    # Save initial book as equilibrium reference
+    # Calculate initial bucket volumes for passive recovery
     initial_book = copy.deepcopy(market_data['order_book'])
+    initial_bucket_volumes = calculate_bucket_volumes(initial_book)
     
-    # Update market_stats to include initial book
+    # Update market_stats to include bucket volumes instead of full book
     market_stats = {
         **market_data,
-        'initial_book': initial_book
+        'initial_bucket_volumes': initial_bucket_volumes 
     }
     
     initial_mid = market_data['mid_price']
@@ -398,19 +524,31 @@ def calculate_execution_cost(
         
         if actual_fill > 0:
             # Calculate price impact
-            impact = calculate_price_impact(actual_fill, interval_seconds, daily_volume)
-            
+            impact = calculate_price_impact(actual_fill, daily_volume, current_mid)
+    
             # Execution price includes temporary impact
             if side == 'buy':
-                execution_price = interval_limit + impact['temporary'] * spread
+                execution_price = interval_limit + impact['temporary']
             else:
-                execution_price = interval_limit - impact['temporary'] * spread
+                execution_price = interval_limit - impact['temporary']
             
             # Update cumulative permanent impact
             if side == 'buy':
-                cumulative_permanent_impact += impact['permanent'] * spread
+                cumulative_permanent_impact += impact['permanent']
             else:
-                cumulative_permanent_impact -= impact['permanent'] * spread
+                cumulative_permanent_impact -= impact['permanent']
+
+            # After calculating permanent impact, shift the entire order book
+            if side == 'buy':  # If we're buying, prices go up
+                for level in current_book['bids']:
+                    level['price'] += impact['permanent']
+                for level in current_book['asks']:
+                    level['price'] += impact['permanent']
+            else:  # If we're selling, prices go down
+                for level in current_book['bids']:
+                    level['price'] -= impact['permanent']
+                for level in current_book['asks']:
+                    level['price'] -= impact['permanent']
             
             # Execute trade
             total_cost += actual_fill * execution_price
@@ -455,7 +593,7 @@ def calculate_execution_cost(
         slippage_bps = ((avg_price - initial_mid) / initial_mid) * 10000
     else:
         slippage_bps = ((initial_mid - avg_price) / initial_mid) * 10000
-    
+
     return {
         'symbol': symbol,
         'side': side,
@@ -472,16 +610,17 @@ def calculate_execution_cost(
         'execution_prices': execution_prices
     }
 
-
 def main():
-    """CLI interface for testing."""
+    """
+    CLI interface for testing.
+    Usage: python twap_clean.py <symbol> <side> <volume> <time_seconds> [limit_price]
+    """
     if len(sys.argv) < 5:
-        print("\nUsage: python twap_clean.py <symbol> <side> <volume> <time_seconds> [limit_price]")
         print("\nRunning default test...")
-        symbol = 'BTCUSD'
-        side = 'buy'
-        volume = 10
-        time_seconds = 300  # 5 minutes
+        symbol = 'USDBTC'
+        side = 'sell'
+        volume = 1000000
+        time_seconds = 6*60*60
         limit_price = None
     else:
         symbol = sys.argv[1]
@@ -497,24 +636,36 @@ def main():
     print(f"Time: {time_seconds}s ({time_seconds/60:.1f} min)")
     print(f"Limit: {limit_price if limit_price else 'None'}")
     
-    result = calculate_execution_cost(symbol, side, volume, time_seconds, limit_price)
+    result = calculate_execution_cost(symbol, side, volume, time_seconds, limit_price, use_live=False)
     
     print("\n=== RESULTS ===")
     for key, value in result.items():
         if isinstance(value, float):
             if 'price' in key or 'cost' in key:
-                print(f"{key}: ${value:,.2f}")
+                # Use scientific notation for very small/large numbers, otherwise fixed
+                if value != 0 and (abs(value) < 0.01 or abs(value) > 1000000):
+                    print(f"{key}: {value:.8e}")
+                else:
+                    print(f"{key}: {value:.8f}")
             elif 'volume' in key:
-                print(f"{key}: {value:.6f}")
+                print(f"{key}: {value:.8f}")
             elif key == 'slippage_bps':
-                print(f"{key}: {value:.1f} bps")
+                print(f"{key}: {value:.2f} bps")
             elif key == 'fill_rate':
-                print(f"{key}: {value:.1f}%")
-            else:
+                print(f"{key}: {value:.2f}%")
+            elif key == 'aggressiveness':
                 print(f"{key}: {value:.4f}")
+            else:
+                print(f"{key}: {value:.6f}")
         elif key == 'execution_prices':
             if value:
-                print(f"price_range: ${min(value):,.2f} - ${max(value):,.2f}")
+                min_price = min(value)
+                max_price = max(value)
+                # Use appropriate formatting based on magnitude
+                if min_price != 0 and (abs(min_price) < 0.01 or abs(min_price) > 1000000):
+                    print(f"price_range: {min_price:.8e} - {max_price:.8e}")
+                else:
+                    print(f"price_range: {min_price:.8f} - {max_price:.8f}")
         else:
             print(f"{key}: {value}")
 
